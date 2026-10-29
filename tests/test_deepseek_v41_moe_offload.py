@@ -547,6 +547,64 @@ def test_in_place_reads_fall_back_when_slot_arrays_are_replaced(tmp_path):
         plan.close()
 
 
+@pytest.mark.parametrize("field", ["weight", "scales"])
+def test_in_place_reads_detect_a_moved_buffer_under_the_same_array(tmp_path, field):
+    """``array[i] = v`` keeps the Python object but can move its buffer."""
+    reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    try:
+        disk.slots.ensure_ids([0, 1, 2])
+        lin = disk.slots.expert.w3
+        owner = lin[field]
+        owner[0] = owner[0]  # same values, same object, possibly a new buffer
+        mx.eval(owner)
+        assert lin[field] is owner
+        disk.slots.ensure_ids([3, 4])  # misses: the in-place path re-checks first
+        x = mx.random.normal((1, 1, 1, 1, 64)).astype(mx.bfloat16)
+        for idx in ([[[3, 4]]], [[[0, 2]]]):
+            idx = mx.array(idx)
+            w = mx.ones(idx.shape) / 2
+            want, got = reference(x, idx, w), disk(x, idx, w)
+            mx.eval(want, got)
+            np.testing.assert_allclose(
+                got.astype(mx.float32), want.astype(mx.float32), rtol=0.01, atol=0.002
+            )
+    finally:
+        plan.close()
+
+
+def test_in_place_slot_bytes_match_the_checkpoint(tmp_path):
+    """Every installed slot holds exactly the expert's stored bytes, over many
+    evictions, and matches what the copying path installs."""
+    import random
+
+    _, disk, plan = _synthetic_affine_experts(tmp_path, 0.375)
+    (tmp_path / "copy").mkdir()
+    _, copy, copy_plan = _synthetic_affine_experts(tmp_path / "copy", 0.375)
+    copy.slots._views = None
+    rng = random.Random(7)
+    try:
+        checked = 0
+        for _ in range(60):
+            ids = rng.sample(range(plan.count), rng.randint(1, plan.capacity))
+            disk.slots.ensure_ids(ids)
+            copy.slots.ensure_ids(ids)
+            for e in ids:
+                for proj in ("w1", "w3", "w2"):
+                    for slab in plan.slabs(disk.slots.prefix, proj, e):
+                        field = slab.key.rsplit(".", 1)[1]
+                        stored = bytes(plan.read(slab))
+                        got = getattr(disk.slots.expert, proj)[field][disk.slots.slot_of[e]]
+                        ref = getattr(copy.slots.expert, proj)[field][copy.slots.slot_of[e]]
+                        assert np.array(got.view(mx.uint8)).tobytes() == stored
+                        assert np.array(ref.view(mx.uint8)).tobytes() == stored
+                        checked += 1
+        assert checked > 200
+        assert disk.slots._views is not None  # stayed on the in-place path
+    finally:
+        plan.close()
+        copy_plan.close()
+
+
 def test_failed_read_leaves_the_cache_intact(tmp_path, monkeypatch):
     from omlx.patches.deepseek_v41.moe_offload import ExpertOffloadPlan
 

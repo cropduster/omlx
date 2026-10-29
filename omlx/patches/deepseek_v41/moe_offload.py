@@ -431,6 +431,8 @@ class _ExpertSlots:
                     view = np.asarray(memoryview(target))
                     if view.shape[0] != self.plan.capacity or view[0].nbytes != slab.nbytes:
                         return None
+                    if _data_ptr(owner) != view.ctypes.data:
+                        return None
                     fields[field] = (owner, target, view)
                 views[proj] = fields
         except (TypeError, ValueError, KeyError, BufferError):
@@ -438,14 +440,20 @@ class _ExpertSlots:
         return views
 
     def _views_current(self):
-        """The views still alias the arrays the expert computes with."""
+        """The views still alias the buffers the expert computes with.
+
+        Checked before every in-place write. Identity alone is not enough:
+        ``array[i] = value`` keeps the Python object but may move it to a new
+        buffer, so the data pointer is compared as well.
+        """
         views = self._views
         if views is None:
             return False
         for proj, fields in views.items():
             lin = getattr(self.expert, proj)
-            for field, (owner, _, _) in fields.items():
-                if lin[field] is not owner:
+            for field, (owner, _, view) in fields.items():
+                current = lin[field]
+                if current is not owner or _data_ptr(current) != view.ctypes.data:
                     self._views = None
                     return False
         return True
@@ -536,8 +544,10 @@ class _ExpertSlots:
         if len(needed) > self.plan.capacity:
             raise ValueError("Expert working set exceeds resident capacity")
         self._score(needed)
-        if self._views_current():
-            return self._ensure_in_place(ids, needed)
+        if self._views is not None:
+            slots = self._ensure_in_place(ids, needed)
+            if slots is not None:
+                return slots
         # Protect the entire working set, including hits encountered after misses.
         misses = []
         for expert in needed:
@@ -616,8 +626,11 @@ class _ExpertSlots:
         every miss is read on the reader pool straight into its slot. An expert
         is installed only when all of its reads succeed; a failed read returns
         the slots of the experts it did not complete to the free list, and
-        every read this call started is drained before it raises.
+        every read this call started is drained before it raises. Returns None,
+        before touching any state, when the views no longer alias the slots.
         """
+        if any(e not in self.slot_of for e in needed) and not self._views_current():
+            return None
         misses = []
         for expert in needed:
             if expert in self.slot_of:
@@ -678,6 +691,11 @@ class _ExpertSlots:
         if failure is not None:
             raise failure
         return [self.slot_of[e] for e in ids]
+
+
+def _data_ptr(array):
+    """Address of an evaluated array's buffer (any dtype, bf16 included)."""
+    return np.frombuffer(memoryview(array), dtype=np.uint8).ctypes.data
 
 
 class _Done:
