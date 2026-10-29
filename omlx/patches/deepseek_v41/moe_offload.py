@@ -47,8 +47,9 @@ EXPERT_IO_WORKERS = 24
 # time is one residency update of a layer (a decode step, a verify block or a
 # prefill chunk), and a use loses half its weight after this many updates.
 # Plain recency let every prefill chunk, which routes through most experts,
-# push the decode working set out of the cache.
-EVICTION_HALF_LIFE = 32
+# push the decode working set out of the cache. Measured on M4 Max with
+# 4K/91K prompts of mixed content: 16 < 32 < 64 ~ 128 per decode cycle.
+EVICTION_HALF_LIFE = 64
 _EXPERT_IO_POOL = ThreadPoolExecutor(
     max_workers=EXPERT_IO_WORKERS, thread_name_prefix="v41-expert-io"
 )
