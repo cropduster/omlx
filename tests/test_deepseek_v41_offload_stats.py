@@ -24,6 +24,7 @@ def stats_off(tmp_path, monkeypatch):
 @pytest.fixture
 def stats_on(tmp_path, monkeypatch):
     monkeypatch.setenv(moe_offload.STATS_ENV, "1")
+    monkeypatch.setenv(moe_offload.RESIDENT_FIRST_ENV, "0")
     monkeypatch.setattr(moe_offload, "STATS_SWITCH", tmp_path / "absent.on")
 
 

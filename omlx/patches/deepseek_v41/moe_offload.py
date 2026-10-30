@@ -76,6 +76,24 @@ _PHASES = ("prefill", "decode")
 _FIELDS = ("calls", "routes", "distinct", "hits", "misses", "bytes", "wait", "sync", "ensure", "tolist")
 
 
+# P1a experiment (off by default): a prefill forward first runs every route of
+# the experts already resident, without reads, then the misses in capacity-sized
+# chunks. Read once per model load.
+RESIDENT_FIRST_ENV = "OMLX_DSV41_PREFILL_RESIDENT_FIRST"
+RESIDENT_FIRST_SWITCH = Path("~/.omlx/dsv41-prefill-resident-first.on").expanduser()
+
+
+def _switch(env, path):
+    value = os.environ.get(env, "").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return False
+    return bool(value) or path.exists()
+
+
+def resident_first_enabled():
+    return _switch(RESIDENT_FIRST_ENV, RESIDENT_FIRST_SWITCH)
+
+
 def stats_enabled():
     value = os.environ.get(STATS_ENV, "").strip().lower()
     if value in ("0", "false", "off", "no"):
@@ -275,6 +293,15 @@ def _stats_for(plan):
             )
         plan._offload_stats = stats
     return plan._offload_stats
+
+
+def _resident_first_for(plan):
+    """Whether this load runs prefill resident-first (decided once per plan)."""
+    if not hasattr(plan, "_resident_first"):
+        plan._resident_first = resident_first_enabled()
+        if plan._resident_first:
+            logger.info("DSV41-OFFLOAD prefill order: resident-first (P1a experiment)")
+    return plan._resident_first
 
 
 def _layer_index(prefix):
@@ -1004,6 +1031,7 @@ class OffloadedExpert(nn.Module):
     def __init__(self, expert, plan, prefix):
         super().__init__()
         self.slots = _ExpertSlots(expert, plan, prefix)
+        self._resident_first = _resident_first_for(plan)
 
     @property
     def quantizes_input(self):
@@ -1018,7 +1046,9 @@ class OffloadedExpert(nn.Module):
             return mx.zeros((*indices.shape, 1, x.shape[-1]), dtype=x.dtype)
         phase = "prefill" if sorted_indices else "decode"
         self.slots._phase = phase
-        if sorted_indices:
+        if sorted_indices and self._resident_first:
+            outputs = self._sorted_resident_first(x, indices, weights, input_quantized)
+        elif sorted_indices:
             outputs = self._sorted(x, indices, weights, input_quantized)
         else:
             outputs = self._routed(x, indices, weights, input_quantized)
@@ -1101,6 +1131,64 @@ class OffloadedExpert(nn.Module):
             # A read-ahead the loop never consumed must not outlive the call.
             self.slots.release_read_ahead()
         return outputs
+
+
+    def _resident_first_chunks(self, ids):
+        """Expert groups of one sorted forward: resident experts first, then misses.
+
+        The resident group needs no reads, so it runs while the first miss group
+        is read ahead. Misses follow in ascending id order, ``capacity`` distinct
+        experts per group, as the plain sorted path cuts them. Fewer misses than
+        that path: an expert resident from the previous forward is not evicted
+        before it runs.
+        """
+        experts = np.unique(np.asarray(ids, dtype=np.int64))
+        resident = self.slots.slot_of
+        hits = [int(e) for e in experts if int(e) in resident]
+        misses = [int(e) for e in experts if int(e) not in resident]
+        capacity = self.slots.plan.capacity
+        groups = [hits] if hits else []
+        groups += [misses[i : i + capacity] for i in range(0, len(misses), capacity)]
+        return groups
+
+    def _sorted_resident_first(self, x, indices, weights, input_quantized):
+        """``_sorted`` with the resident experts' routes first (P1a experiment).
+
+        Each group gathers the routes of its experts (positions stay ascending,
+        so its ids stay sorted), runs as one chunk, and the outputs are put back
+        in the routes' sorted order, which the caller's combine expects.
+        """
+        ids = indices.reshape(-1).tolist()
+        flat = np.asarray(ids, dtype=np.int64)
+        rows = x.reshape(-1, 1, x.shape[-1])
+        scores = None if weights is None else weights.reshape(-1)
+        groups = self._resident_first_chunks(ids)
+        outputs, positions = [], []
+        try:
+            for k, group in enumerate(groups):
+                pos_np = np.flatnonzero(np.isin(flat, group))
+                pos = mx.array(pos_np.astype(np.int32))
+                slots = mx.array(self.slots.ensure_ids(flat[pos_np].tolist()), dtype=mx.int32)
+                order = mx.argsort(slots)
+                inverse = mx.argsort(order)
+                out = self.slots.expert(
+                    rows[pos][order],
+                    slots[order],
+                    None if scores is None else scores[pos][order],
+                    sorted_indices=True,
+                    input_quantized=input_quantized,
+                )[inverse]
+                if k + 1 < len(groups):
+                    self.slots.read_ahead(groups[k + 1])
+                mx.eval(out)
+                outputs.append(out)
+                positions.append(pos_np)
+        finally:
+            self.slots.release_read_ahead()
+        if len(outputs) == 1:
+            return outputs
+        back = np.argsort(np.concatenate(positions), kind="stable").astype(np.int32)
+        return [mx.concatenate(outputs, axis=0)[mx.array(back)]]
 
 
 def _plan(path, fraction, mtp_resident=False):

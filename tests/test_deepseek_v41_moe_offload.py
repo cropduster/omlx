@@ -647,8 +647,11 @@ def test_failed_read_leaves_the_cache_intact(tmp_path, monkeypatch):
 
 
 def test_sorted_routes_chunk_on_expert_boundaries(tmp_path, monkeypatch):
+    from omlx.patches.deepseek_v41 import moe_offload
     from omlx.patches.deepseek_v41.language import Expert
 
+    # The plain sorted path; the resident-first experiment has its own tests.
+    monkeypatch.setenv(moe_offload.RESIDENT_FIRST_ENV, "0")
     reference, disk, plan = _synthetic_affine_experts(tmp_path, 0.25)
     calls = []
     original = Expert.__call__
