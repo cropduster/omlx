@@ -13,8 +13,11 @@ which expert runs.
 
 import contextlib
 import json
+import logging
 import math
 import os
+import threading
+import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -56,6 +59,223 @@ _EXPERT_IO_POOL = ThreadPoolExecutor(
 
 # One positional read: a whole tensor, or one leading-axis row of it.
 Slab = namedtuple("Slab", "key expert fd offset nbytes dtype shape")
+
+logger = logging.getLogger(__name__)
+
+# Residency statistics (off by default). Enabled at load time by the
+# environment variable below or by the switch file, so a measurement build can
+# be turned on and off without editing code or settings.
+STATS_ENV = "OMLX_DSV41_OFFLOAD_STATS"
+STATS_SWITCH = Path("~/.omlx/dsv41-offload-stats.on").expanduser()
+# Decode windows in forwards after a request starts: 1-16, 17-64, then 256 each.
+STATS_WINDOWS = (16, 64)
+STATS_WINDOW_TAIL = 256
+# A decode pause longer than this starts a new request.
+STATS_IDLE_S = 2.0
+_PHASES = ("prefill", "decode")
+_FIELDS = ("calls", "routes", "distinct", "hits", "misses", "bytes", "wait", "sync", "ensure", "tolist")
+
+
+def stats_enabled():
+    value = os.environ.get(STATS_ENV, "").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return False
+    return bool(value) or STATS_SWITCH.exists()
+
+
+class OffloadStats:
+    """Per-forward prefill and windowed decode residency counters, logged as one line each.
+
+    Layers report each residency update with ``record`` and the end of their MoE
+    call with ``layer_done``. The last layer's ``layer_done`` closes a forward. The
+    lower half of the layers (``lo``) runs on the whole prefill chunk; under CED
+    prefill the upper half (``hi``) runs on the decoder tail only.
+    """
+
+    def __init__(self, n_layers, top_k, clock=time.perf_counter, emit=None, idle_s=STATS_IDLE_S,
+                 watchdog=True):
+        self.n_layers, self.top_k = n_layers, max(1, top_k)
+        self.split = n_layers // 2
+        self.clock = clock
+        self.emit = emit if emit is not None else (lambda line: logger.info(line))
+        self.idle_s = idle_s
+        self.lock = threading.Lock()
+        self.request = 0
+        self.prefill_forwards = 0
+        self.decode_steps = 0
+        self.window_start = 0
+        self.last_event = None
+        self._acc = {phase: self._zero() for phase in _PHASES}
+        self._began = {phase: None for phase in _PHASES}
+        self._closed = False
+        self._thread = None
+        if watchdog:
+            self._thread = threading.Thread(target=self._watch, name="v41-offload-stats", daemon=True)
+            self._thread.start()
+
+    @staticmethod
+    def _zero():
+        return {"lo": dict.fromkeys(_FIELDS, 0), "hi": dict.fromkeys(_FIELDS, 0), "chunks": 0}
+
+    def _group(self, layer):
+        return "lo" if layer < self.split else "hi"
+
+    def _new_request_if_idle(self, now):
+        # Caller holds the lock.
+        if self.last_event is not None and now - self.last_event > self.idle_s:
+            self._flush_decode(now, reason="idle")
+            self.request += 1
+            self.prefill_forwards = self.decode_steps = self.window_start = 0
+
+    def record(self, phase, layer, *, routes, distinct, hits, misses, nbytes, wait, sync, ensure, tolist=0.0):
+        with self.lock:
+            now = self.clock()
+            if self._began[phase] is None:
+                self._new_request_if_idle(now)
+                self._began[phase] = now
+                if phase == "prefill" and self.decode_steps:
+                    # A prefill after decode is a new turn of the conversation.
+                    self._flush_decode(now, reason="prefill")
+                    self.request += 1
+                    self.prefill_forwards = self.decode_steps = self.window_start = 0
+            g = self._acc[phase][self._group(layer)]
+            g["calls"] += 1
+            g["routes"] += routes
+            g["distinct"] += distinct
+            g["hits"] += hits
+            g["misses"] += misses
+            g["bytes"] += nbytes
+            g["wait"] += wait
+            g["sync"] += sync
+            g["ensure"] += ensure
+            g["tolist"] += tolist
+            if phase == "prefill":
+                self._acc[phase]["chunks"] += 1
+            self.last_event = now
+
+    def layer_done(self, phase, layer):
+        if layer != self.n_layers - 1:
+            return
+        with self.lock:
+            now = self.clock()
+            self.last_event = now
+            if phase == "prefill":
+                self.prefill_forwards += 1
+                self._emit_prefill(now)
+                return
+            if self._began["decode"] is None:
+                return
+            self.decode_steps += 1
+            if self.decode_steps >= self._window_end():
+                self._flush_decode(now, reason="window")
+
+    def _window_end(self):
+        start = self.window_start
+        for bound in STATS_WINDOWS:
+            if start < bound:
+                return bound
+        return start + STATS_WINDOW_TAIL
+
+    @staticmethod
+    def _sum(acc, field):
+        return acc["lo"][field] + acc["hi"][field]
+
+    def _emit_prefill(self, now):
+        acc, began = self._acc["prefill"], self._began["prefill"]
+        routes = self._sum(acc, "routes")
+        lo, hi = acc["lo"], acc["hi"]
+        self.emit(
+            "DSV41-OFFLOAD prefill req=%d fwd=%d wall_s=%.2f chunks=%d routes=%d distinct=%d "
+            "hits=%d misses=%d read_gb=%.2f read_bytes=%d wait_s=%.2f sync_s=%.2f ensure_s=%.2f "
+            "lo_misses=%d lo_distinct=%d hi_misses=%d hi_distinct=%d hi_routes=%d"
+            % (
+                self.request, self.prefill_forwards, now - began, acc["chunks"], routes,
+                self._sum(acc, "distinct"), self._sum(acc, "hits"), self._sum(acc, "misses"),
+                self._sum(acc, "bytes") / 1e9, self._sum(acc, "bytes"), self._sum(acc, "wait"),
+                self._sum(acc, "sync"),
+                self._sum(acc, "ensure"), lo["misses"], lo["distinct"], hi["misses"],
+                hi["distinct"], hi["routes"],
+            )
+        )
+        self._acc["prefill"] = self._zero()
+        self._began["prefill"] = None
+
+    def _flush_decode(self, now, reason):
+        # Caller holds the lock.
+        acc, began = self._acc["decode"], self._began["decode"]
+        steps = self.decode_steps - self.window_start
+        if began is None or steps <= 0:
+            self._acc["decode"] = self._zero()
+            self._began["decode"] = None
+            return
+        routes = self._sum(acc, "routes")
+        misses = self._sum(acc, "misses")
+        end = self.last_event if reason == "idle" else now
+        wall = max(0.0, end - began)
+        self.emit(
+            "DSV41-OFFLOAD decode req=%d win=%d-%d steps=%d reason=%s rows_per_step=%.2f "
+            "misses_per_step=%.2f miss_per_kroute=%.1f hits=%d misses=%d read_mb=%.1f "
+            "wall_ms_per_step=%.1f wait_ms_per_step=%.1f sync_ms_per_step=%.1f "
+            "ensure_ms_per_step=%.1f tolist_ms_per_step=%.1f lo_misses=%d hi_misses=%d"
+            % (
+                self.request, self.window_start + 1, self.decode_steps, steps, reason,
+                routes / (steps * self.n_layers * self.top_k), misses / steps,
+                1000.0 * misses / max(1, routes), self._sum(acc, "hits"), misses,
+                self._sum(acc, "bytes") / 1e6, 1000.0 * wall / steps,
+                1000.0 * self._sum(acc, "wait") / steps, 1000.0 * self._sum(acc, "sync") / steps,
+                1000.0 * self._sum(acc, "ensure") / steps, 1000.0 * self._sum(acc, "tolist") / steps,
+                acc["lo"]["misses"], acc["hi"]["misses"],
+            )
+        )
+        self.window_start = self.decode_steps
+        self._acc["decode"] = self._zero()
+        self._began["decode"] = None if reason != "window" else now
+
+    def poll(self):
+        """Flush a decode window whose request went idle (the watchdog calls this)."""
+        with self.lock:
+            now = self.clock()
+            if (
+                self._began["decode"] is not None
+                and self.last_event is not None
+                and now - self.last_event > self.idle_s
+            ):
+                self._flush_decode(now, reason="idle")
+                self.request += 1
+                self.prefill_forwards = self.decode_steps = self.window_start = 0
+                self.last_event = None
+
+    def _watch(self):
+        while not self._closed:
+            time.sleep(min(1.0, self.idle_s / 2))
+            try:
+                self.poll()
+            except Exception:  # noqa: BLE001 - statistics must never break serving
+                logger.debug("offload stats poll failed", exc_info=True)
+
+    def close(self):
+        self._closed = True
+
+
+def _stats_for(plan):
+    """The plan's shared statistics collector, or None when statistics are off."""
+    if not hasattr(plan, "_offload_stats"):
+        stats = None
+        if stats_enabled():
+            stats = OffloadStats(len(plan.layers), plan.floor)
+            logger.info(
+                "DSV41-OFFLOAD stats enabled: %d layers, top-%d, capacity %d/%d",
+                len(plan.layers), plan.floor, plan.capacity, plan.count,
+            )
+        plan._offload_stats = stats
+    return plan._offload_stats
+
+
+def _layer_index(prefix):
+    try:
+        return int(prefix.split(".layers.", 1)[1].split(".", 1)[0])
+    except (IndexError, ValueError):
+        return -1
 
 
 def _fields(spec):
@@ -377,6 +597,9 @@ class ExpertOffloadPlan:
         for fd in fds.values():
             with contextlib.suppress(OSError):
                 os.close(fd)
+        stats = getattr(self, "_offload_stats", None)
+        if stats is not None:
+            stats.close()
 
 
 class _ExpertSlots:
@@ -386,6 +609,13 @@ class _ExpertSlots:
         self.free = list(range(plan.capacity))
         self.hits = self.misses = 0
         self.fetched_bytes = 0
+        # Seconds spent waiting for reads, draining the GPU before in-place
+        # writes, and syncing routing ids to the host (cumulative, like hits).
+        self.wait_s = self.sync_s = self.tolist_s = 0.0
+        self.layer = _layer_index(prefix)
+        self.stats = _stats_for(plan)
+        self._phase = "decode"
+        self._tolist_reported = 0.0
         # Experts whose reads a prefill started early: expert -> the same
         # ``(proj, slabs, futures)`` shape ``ensure_ids`` builds.
         self._ahead = {}
@@ -485,7 +715,10 @@ class _ExpertSlots:
         return best
 
     def ensure(self, indices):
-        slots = self.ensure_ids(indices.reshape(-1).tolist())
+        began = time.perf_counter()
+        ids = indices.reshape(-1).tolist()
+        self.tolist_s += time.perf_counter() - began
+        slots = self.ensure_ids(ids)
         return mx.array(slots, dtype=mx.int32).reshape(indices.shape)
 
     def read_ahead(self, ids):
@@ -532,6 +765,32 @@ class _ExpertSlots:
         return len(ahead)
 
     def ensure_ids(self, ids):
+        """``_ensure_ids``, reported to the statistics collector when it is on."""
+        stats = self.stats
+        if stats is None:
+            return self._ensure_ids(ids)
+        hits, misses, fetched = self.hits, self.misses, self.fetched_bytes
+        wait, sync = self.wait_s, self.sync_s
+        began = time.perf_counter()
+        slots = self._ensure_ids(ids)
+        ensure = time.perf_counter() - began
+        tolist, self._tolist_reported = self.tolist_s - self._tolist_reported, self.tolist_s
+        stats.record(
+            self._phase,
+            self.layer,
+            routes=len(ids),
+            distinct=len(dict.fromkeys(ids)),
+            hits=self.hits - hits,
+            misses=self.misses - misses,
+            nbytes=self.fetched_bytes - fetched,
+            wait=self.wait_s - wait,
+            sync=self.sync_s - sync,
+            ensure=ensure,
+            tolist=tolist,
+        )
+        return slots
+
+    def _ensure_ids(self, ids):
         """Make every expert in ``ids`` resident; return their slots in order.
 
         Two passes. The first starts the misses' reads on the reader pool,
@@ -589,7 +848,9 @@ class _ExpertSlots:
                 submit(done + window)
                 arrays, nbytes = {}, 0
                 for proj, slabs, futures in pending[expert]:
+                    waited = time.perf_counter()
                     raws = [future.result() for future in futures]
+                    self.wait_s += time.perf_counter() - waited
                     arrays[proj] = self.plan.decode(slabs, raws)
                     nbytes += sum(slab.nbytes for slab in slabs)
                     del raws, futures
@@ -646,7 +907,9 @@ class _ExpertSlots:
         for expert in misses:
             slot = self.free.pop() if self.free else self.slot_of.pop(self._victim(protected))
             placed.append((expert, slot))
+        drained = time.perf_counter()
         mx.synchronize()
+        self.sync_s += time.perf_counter() - drained
         reads, done, failure = {}, [], None
         try:
             for expert, slot in placed:
@@ -669,9 +932,11 @@ class _ExpertSlots:
             for expert, slot in placed:
                 try:
                     nbytes = 0
+                    waited = time.perf_counter()
                     for slab, future in reads[expert]:
                         future.result()
                         nbytes += slab.nbytes
+                    self.wait_s += time.perf_counter() - waited
                 except BaseException as exc:  # noqa: BLE001 - re-raised below
                     failure = failure or exc
                     continue
@@ -745,10 +1010,14 @@ class OffloadedExpert(nn.Module):
             raise RuntimeError("MoE expert store is closed")
         if indices.size == 0:
             return mx.zeros((*indices.shape, 1, x.shape[-1]), dtype=x.dtype)
+        phase = "prefill" if sorted_indices else "decode"
+        self.slots._phase = phase
         if sorted_indices:
             outputs = self._sorted(x, indices, weights, input_quantized)
         else:
             outputs = self._routed(x, indices, weights, input_quantized)
+        if self.slots.stats is not None:
+            self.slots.stats.layer_done(phase, self.slots.layer)
         return mx.concatenate(outputs, axis=0).reshape(*indices.shape, 1, x.shape[-1])
 
     def _routed(self, x, indices, weights, input_quantized):
