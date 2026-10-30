@@ -150,6 +150,23 @@ def test_prefill_after_decode_closes_the_turn():
     assert _fields(lines[3])["fwd"] == "1"
 
 
+def test_pauses_inside_a_request_do_not_split_it():
+    stats, clock, lines = _collector(idle_s=2.0)
+    _forward(stats, clock, "prefill")
+    clock.now += 30.0  # boundary snapshot between prefill forwards
+    _forward(stats, clock, "prefill")
+    clock.now += 5.0  # sampling / scheduling before the first decode step
+    stats.poll()
+    for _ in range(16):
+        _forward(stats, clock, "decode")
+    reqs = [_fields(line)["req"] for line in lines]
+    assert reqs == ["0", "0", "0"]
+    assert _fields(lines[1])["fwd"] == "2"
+    clock.now += 3.0
+    _forward(stats, clock, "prefill")
+    assert _fields(lines[-1])["req"] == "1" and _fields(lines[-1])["fwd"] == "1"
+
+
 def test_unfinished_decode_layers_do_not_count_a_step():
     stats, clock, lines = _collector(n_layers=4)
     stats.record("decode", 0, routes=2, distinct=1, hits=1, misses=0, nbytes=0,

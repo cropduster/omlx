@@ -121,8 +121,14 @@ class OffloadStats:
         return "lo" if layer < self.split else "hi"
 
     def _new_request_if_idle(self, now):
-        # Caller holds the lock.
-        if self.last_event is not None and now - self.last_event > self.idle_s:
+        # Caller holds the lock. Only a pause after decode ends a request: prefill
+        # forwards of one request may be seconds apart (boundary snapshots), and so
+        # may the last prefill forward and the first decode step.
+        if (
+            self.decode_steps
+            and self.last_event is not None
+            and now - self.last_event > self.idle_s
+        ):
             self._flush_decode(now, reason="idle")
             self.request += 1
             self.prefill_forwards = self.decode_steps = self.window_start = 0
