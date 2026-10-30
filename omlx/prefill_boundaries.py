@@ -25,3 +25,32 @@ def should_emit_prefill_boundary(
         and total_tokens % block_size == 0
         and last_emitted_tokens < total_tokens
     )
+
+
+def merge_short_prefill_chunk(
+    chunk_tokens: int,
+    *,
+    remaining: int,
+    block_size: int,
+    step_size: int,
+    min_chunk: int,
+) -> int:
+    """Grow a chunk so that no forward is shorter than ``min_chunk`` tokens.
+
+    Applied after the boundary clamp. A short leading piece up to a block
+    boundary (a prefix-cache resume that is not block aligned) runs together
+    with the following block, and a short remainder after this chunk joins it.
+    Models whose cost per forward barely depends on its length (one pass over
+    SSD-offloaded experts per forward) gain the most. Chunks still end on a
+    block boundary or at the end of the input, so boundary snapshots stay
+    exact; only the snapshot at the skipped boundary is not taken.
+    ``min_chunk <= 0`` disables the merge.
+    """
+    n = chunk_tokens
+    if min_chunk <= 0 or n >= remaining:
+        return n
+    if n < min_chunk:
+        n = min(remaining, n + (block_size if block_size > 0 else step_size))
+    if 0 < remaining - n < min_chunk:
+        n = remaining
+    return n

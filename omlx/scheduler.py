@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import os
 import threading
 import time
 from array import array
@@ -77,6 +78,7 @@ from .prefill.packed import (
 )
 from .prefill_boundaries import (
     clamp_prefill_chunk_to_boundary,
+    merge_short_prefill_chunk,
     should_emit_prefill_boundary,
 )
 from .prefill_progress import get_prefill_tracker
@@ -3221,6 +3223,57 @@ class Scheduler:
             )
             self.config.paged_cache_block_size = target_block_size
 
+    # DeepSeek V4.1 with SSD-offloaded experts reads every routed expert once
+    # per prefill forward, ~17-19 s whatever the forward's length. A short
+    # forward (a prefix-cache resume up to the next block boundary, or the
+    # remainder after the last full step) costs a whole pass. Experiment, off
+    # by default: switch file or OMLX_DSV41_PREFILL_MERGE (0 = off, 1 = on,
+    # or the minimum chunk in tokens).
+    PREFILL_MERGE_MIN_TOKENS = 2048
+    PREFILL_MERGE_ENV = "OMLX_DSV41_PREFILL_MERGE"
+    PREFILL_MERGE_SWITCH = "~/.omlx/dsv41-prefill-merge.on"
+
+    def _prefill_merge_min_chunk(self) -> int:
+        """Minimum prefill forward in tokens for this model, 0 when merging is off."""
+        model_type = getattr(self, "_prefill_merge_model_type", None)
+        if model_type is None:
+            model_type = str(getattr(self.model, "model_type", "") or "") or str(
+                getattr(getattr(self.model, "config", None), "model_type", "") or ""
+            )
+            self._prefill_merge_model_type = model_type
+        if model_type != "deepseek_v41":
+            return 0
+        value = os.environ.get(Scheduler.PREFILL_MERGE_ENV, "").strip().lower()
+        if value in ("0", "false", "off", "no"):
+            return 0
+        if value.isdigit():
+            return int(value)
+        if value or os.path.exists(os.path.expanduser(Scheduler.PREFILL_MERGE_SWITCH)):
+            return Scheduler.PREFILL_MERGE_MIN_TOKENS
+        return 0
+
+    def _merge_short_prefill_chunk(
+        self, n: int, *, remaining: int, block_size: int, step_size: int, request_id=None
+    ) -> int:
+        min_chunk = Scheduler._prefill_merge_min_chunk(self)
+        merged = merge_short_prefill_chunk(
+            n,
+            remaining=remaining,
+            block_size=block_size,
+            step_size=step_size,
+            min_chunk=min_chunk,
+        )
+        if merged != n:
+            logger.info(
+                "Prefill merge for %s: chunk %d -> %d tokens (remaining %d, min %d)",
+                request_id,
+                n,
+                merged,
+                remaining,
+                min_chunk,
+            )
+        return merged
+
     def _detect_qwen35_prefill_floor(self) -> int:
         """Return the wide-prefill floor for Qwen/GLM hybrid architectures."""
         try:
@@ -4462,6 +4515,14 @@ class Scheduler:
                     cache_tokens=base_size + processed_tokens,
                     block_size=block_size,
                 )
+            n_to_process = Scheduler._merge_short_prefill_chunk(
+                self,
+                n_to_process,
+                remaining=remaining,
+                block_size=block_size if boundary_enabled else 0,
+                step_size=prefill_step_size,
+                request_id=request.request_id,
+            )
             # Stop once more at the tail position so its state is captured.
             if tail_at is not None and base_size + processed_tokens < tail_at:
                 n_to_process = min(n_to_process, tail_at - base_size - processed_tokens)
@@ -6716,6 +6777,15 @@ class Scheduler:
                 n,
                 cache_tokens=state.base_size + state.tokens_processed,
                 block_size=state.block_size,
+            )
+        if limit is None:
+            n = Scheduler._merge_short_prefill_chunk(
+                self,
+                n,
+                remaining=remaining,
+                block_size=state.block_size if state.boundary_enabled else 0,
+                step_size=prefill_step_size,
+                request_id=state.request.request_id,
             )
         # Stop once more at the tail position so its state is captured.
         cache_tokens = state.base_size + state.tokens_processed
