@@ -73,7 +73,7 @@ STATS_WINDOW_TAIL = 256
 # A decode pause longer than this starts a new request.
 STATS_IDLE_S = 2.0
 _PHASES = ("prefill", "decode")
-_FIELDS = ("calls", "routes", "distinct", "hits", "misses", "bytes", "wait", "sync", "ensure", "tolist")
+_FIELDS = ("calls", "routes", "distinct", "hits", "misses", "bytes", "wait", "sync", "ensure", "tolist", "wasted")
 
 
 # P1a experiment (off by default): a prefill forward first runs every route of
@@ -88,6 +88,23 @@ def _switch(env, path):
     if value in ("0", "false", "off", "no"):
         return False
     return bool(value) or path.exists()
+
+
+# P5 experiment (off by default): while a lower-half layer finishes its prefill
+# MoE, start reading the next layer's lowest non-resident experts. Full prefill
+# chunks route through ~95% of the experts of those layers, so the guess rarely
+# misses, and the drive no longer idles between a layer's last read and the
+# next layer's first. Read once per model load.
+PREFETCH_ENV = "OMLX_DSV41_PREFILL_PREFETCH"
+PREFETCH_SWITCH = Path("~/.omlx/dsv41-prefill-prefetch.on").expanduser()
+# Host bytes the next layer's speculative reads may hold (about 160 experts).
+PREFETCH_BYTES = 2 * 1024 * 1024 * 1024
+# Only chunks of at least this many tokens prefetch (sparser routing guesses worse).
+PREFETCH_MIN_TOKENS = 2048
+
+
+def prefetch_enabled():
+    return _switch(PREFETCH_ENV, PREFETCH_SWITCH)
 
 
 def resident_first_enabled():
@@ -177,6 +194,12 @@ class OffloadStats:
                 self._acc[phase]["chunks"] += 1
             self.last_event = now
 
+    def record_wasted(self, phase, layer, count):
+        """Read-ahead entries dropped unconsumed (speculative reads that missed)."""
+        if count:
+            with self.lock:
+                self._acc[phase][self._group(layer)]["wasted"] += count
+
     def layer_done(self, phase, layer):
         if layer != self.n_layers - 1:
             return
@@ -211,14 +234,14 @@ class OffloadStats:
         self.emit(
             "DSV41-OFFLOAD prefill req=%d fwd=%d wall_s=%.2f chunks=%d routes=%d distinct=%d "
             "hits=%d misses=%d read_gb=%.2f read_bytes=%d wait_s=%.2f sync_s=%.2f ensure_s=%.2f "
-            "lo_misses=%d lo_distinct=%d hi_misses=%d hi_distinct=%d hi_routes=%d"
+            "lo_misses=%d lo_distinct=%d hi_misses=%d hi_distinct=%d hi_routes=%d wasted=%d"
             % (
                 self.request, self.prefill_forwards, now - began, acc["chunks"], routes,
                 self._sum(acc, "distinct"), self._sum(acc, "hits"), self._sum(acc, "misses"),
                 self._sum(acc, "bytes") / 1e9, self._sum(acc, "bytes"), self._sum(acc, "wait"),
                 self._sum(acc, "sync"),
                 self._sum(acc, "ensure"), lo["misses"], lo["distinct"], hi["misses"],
-                hi["distinct"], hi["routes"],
+                hi["distinct"], hi["routes"], self._sum(acc, "wasted"),
             )
         )
         self._acc["prefill"] = self._zero()
@@ -302,6 +325,14 @@ def _resident_first_for(plan):
         if plan._resident_first:
             logger.info("DSV41-OFFLOAD prefill order: resident-first (P1a experiment)")
     return plan._resident_first
+
+
+def _prefetch_for(plan):
+    if not hasattr(plan, "_prefetch_next"):
+        plan._prefetch_next = prefetch_enabled()
+        if plan._prefetch_next:
+            logger.info("DSV41-OFFLOAD prefill next-layer prefetch on (P5 experiment)")
+    return plan._prefetch_next
 
 
 def _layer_index(prefix):
@@ -647,6 +678,7 @@ class _ExpertSlots:
         self.wait_s = self.sync_s = self.tolist_s = 0.0
         self.layer = _layer_index(prefix)
         self.stats = _stats_for(plan)
+        plan.__dict__.setdefault("_slots_by_layer", {})[self.layer] = self
         self._phase = "decode"
         self._tolist_reported = 0.0
         # Experts whose reads a prefill started early: expert -> the same
@@ -754,7 +786,7 @@ class _ExpertSlots:
         slots = self.ensure_ids(ids)
         return mx.array(slots, dtype=mx.int32).reshape(indices.shape)
 
-    def read_ahead(self, ids):
+    def read_ahead(self, ids, limit_bytes=None):
         """Start the reads a later ``ensure_ids`` would otherwise wait for.
 
         The SSD idles while the GPU evaluates the chunk that just ran, so the
@@ -768,7 +800,8 @@ class _ExpertSlots:
         Entries no later call consumes are dropped by ``release_read_ahead``,
         which a prefill's ``finally`` always runs.
         """
-        window = max(1, INFLIGHT_BYTES // max(1, self.plan.expert_bytes))
+        budget = INFLIGHT_BYTES if limit_bytes is None else limit_bytes
+        window = max(1, budget // max(1, self.plan.expert_bytes))
         room = window - len(self._ahead)
         started = 0
         for expert in dict.fromkeys(ids):
@@ -1032,6 +1065,7 @@ class OffloadedExpert(nn.Module):
         super().__init__()
         self.slots = _ExpertSlots(expert, plan, prefix)
         self._resident_first = _resident_first_for(plan)
+        self._prefetch_next = _prefetch_for(plan)
 
     @property
     def quantizes_input(self):
@@ -1058,6 +1092,9 @@ class OffloadedExpert(nn.Module):
 
     def _routed(self, x, indices, weights, input_quantized):
         """Per-token top-k routes: bound each chunk by its route count."""
+        if self.slots._ahead:
+            # A prefill's speculative reads for this layer it never consumed.
+            self.slots.release_read_ahead()
         flat_i = indices.reshape(-1, indices.shape[-1])
         flat_x = x.reshape(-1, 1, 1, x.shape[-1])
         flat_w = None if weights is None else weights.reshape(flat_i.shape)
@@ -1112,6 +1149,8 @@ class OffloadedExpert(nn.Module):
             while start < len(ids):
                 end = self._chunk_end(ids, start, capacity)
                 slots = mx.array(self.slots.ensure_ids(ids[start:end]), dtype=mx.int32)
+                if self._prefetch_next and end >= len(ids):
+                    self._prefetch_next_layer(len(ids))
                 order = mx.argsort(slots)
                 inverse = mx.argsort(order)
                 out = self.slots.expert(
@@ -1129,9 +1168,33 @@ class OffloadedExpert(nn.Module):
                 start = end
         finally:
             # A read-ahead the loop never consumed must not outlive the call.
-            self.slots.release_read_ahead()
+            wasted = self.slots.release_read_ahead()
+            if self.slots.stats is not None:
+                self.slots.stats.record_wasted("prefill", self.slots.layer, wasted)
         return outputs
 
+
+    def _prefetch_next_layer(self, n_routes):
+        """Start the next layer's likely first misses (P5 experiment).
+
+        Only for a full prefill chunk in the lower half of the layers, whose
+        chunks route through nearly every expert; the upper half runs the CED
+        tail and routes far fewer. The guess is the next layer's lowest
+        non-resident ids: the first miss group under either prefill order.
+        Unused reads are dropped when that layer's prefill ends.
+        """
+        slots = self.slots
+        plan = slots.plan
+        split = len(plan.layers) // 2
+        nxt = plan.__dict__.get("_slots_by_layer", {}).get(slots.layer + 1)
+        if (
+            nxt is None
+            or slots.layer + 1 >= split
+            or n_routes < PREFETCH_MIN_TOKENS * plan.floor
+        ):
+            return 0
+        candidates = [e for e in range(plan.count) if e not in nxt.slot_of][: plan.capacity]
+        return nxt.read_ahead(candidates, limit_bytes=PREFETCH_BYTES)
 
     def _resident_first_chunks(self, ids):
         """Expert groups of one sorted forward: resident experts first, then misses.
@@ -1169,6 +1232,8 @@ class OffloadedExpert(nn.Module):
                 pos_np = np.flatnonzero(np.isin(flat, group))
                 pos = mx.array(pos_np.astype(np.int32))
                 slots = mx.array(self.slots.ensure_ids(flat[pos_np].tolist()), dtype=mx.int32)
+                if self._prefetch_next and k + 1 == len(groups):
+                    self._prefetch_next_layer(len(ids))
                 order = mx.argsort(slots)
                 inverse = mx.argsort(order)
                 out = self.slots.expert(
@@ -1184,7 +1249,9 @@ class OffloadedExpert(nn.Module):
                 outputs.append(out)
                 positions.append(pos_np)
         finally:
-            self.slots.release_read_ahead()
+            wasted = self.slots.release_read_ahead()
+            if self.slots.stats is not None:
+                self.slots.stats.record_wasted("prefill", self.slots.layer, wasted)
         if len(outputs) == 1:
             return outputs
         back = np.argsort(np.concatenate(positions), kind="stable").astype(np.int32)
